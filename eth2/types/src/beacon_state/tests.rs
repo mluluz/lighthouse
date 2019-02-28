@@ -4,6 +4,7 @@ use super::*;
 use crate::test_utils::{SeedableRng, TestRandom, XorShiftRng};
 use crate::{BeaconState, ChainSpec};
 use ssz::{ssz_encode, Decodable};
+use std::iter::FromIterator;
 
 #[test]
 pub fn can_produce_genesis_block() {
@@ -50,11 +51,13 @@ pub fn get_attestation_participants_consistency() {
                 bitfield.set(i, true);
             }
 
+            let committee = HashSet::from_iter(committee.iter().cloned());
+
             assert_eq!(
                 state
                     .get_attestation_participants(&attestation_data, &bitfield, &spec)
                     .unwrap(),
-                *committee
+                committee
             );
         }
     }

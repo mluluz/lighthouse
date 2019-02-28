@@ -1,3 +1,4 @@
+use self::attestations::GroupedAttesters;
 use integer_sqrt::IntegerSquareRoot;
 use log::{debug, trace};
 use rayon::prelude::*;
@@ -9,6 +10,7 @@ use types::{
     Crosslink, Epoch, Hash256, InclusionError, PendingAttestation, RelativeEpoch,
 };
 
+mod attestations;
 mod tests;
 
 macro_rules! safe_add_assign {
@@ -42,7 +44,7 @@ pub enum WinningRootError {
 #[derive(Clone)]
 pub struct WinningRoot {
     pub shard_block_root: Hash256,
-    pub attesting_validator_indices: Vec<usize>,
+    pub attesting_validator_indices: HashSet<usize>,
     pub total_balance: u64,
     pub total_attesting_balance: u64,
 }
@@ -71,19 +73,16 @@ impl EpochProcessable for BeaconState {
         self.build_epoch_cache(RelativeEpoch::Current, spec)?;
         self.build_epoch_cache(RelativeEpoch::Next, spec)?;
 
-        /*
-         * Validators attesting during the current epoch.
-         */
+        let attesters = GroupedAttesters::new(&self, spec)?;
+
         let active_validator_indices = get_active_validator_indices(
             &self.validator_registry,
             self.slot.epoch(spec.epoch_length),
         );
-        let current_total_balance = self.get_total_balance(&active_validator_indices[..], spec);
-
-        trace!(
-            "{} validators with a total balance of {} wei.",
-            active_validator_indices.len(),
-            current_total_balance
+        let current_total_balance = self.get_total_balance(active_validator_indices.iter(), spec);
+        let previous_total_balance = self.get_total_balance(
+            get_active_validator_indices(&self.validator_registry, previous_epoch).iter(),
+            spec,
         );
 
         let current_epoch_attestations: Vec<&PendingAttestation> = self
@@ -95,43 +94,6 @@ impl EpochProcessable for BeaconState {
             })
             .collect();
 
-        trace!(
-            "Current epoch attestations: {}",
-            current_epoch_attestations.len()
-        );
-
-        let current_epoch_boundary_attestations: Vec<&PendingAttestation> =
-            current_epoch_attestations
-                .par_iter()
-                .filter(
-                    |a| match self.get_block_root(self.current_epoch_start_slot(spec), spec) {
-                        Some(block_root) => {
-                            (a.data.epoch_boundary_root == *block_root)
-                                && (a.data.justified_epoch == self.justified_epoch)
-                        }
-                        None => unreachable!(),
-                    },
-                )
-                .cloned()
-                .collect();
-
-        let current_epoch_boundary_attester_indices = self
-            .get_attestation_participants_union(&current_epoch_boundary_attestations[..], spec)?;
-        let current_epoch_boundary_attesting_balance =
-            self.get_total_balance(&current_epoch_boundary_attester_indices[..], spec);
-
-        trace!(
-            "Current epoch boundary attesters: {}",
-            current_epoch_boundary_attester_indices.len()
-        );
-
-        /*
-         * Validators attesting during the previous epoch
-         */
-
-        /*
-         * Validators that made an attestation during the previous epoch
-         */
         let previous_epoch_attestations: Vec<&PendingAttestation> = self
             .latest_attestations
             .par_iter()
@@ -141,84 +103,6 @@ impl EpochProcessable for BeaconState {
                     == self.previous_epoch(spec)
             })
             .collect();
-
-        debug!(
-            "previous epoch attestations: {}",
-            previous_epoch_attestations.len()
-        );
-
-        let previous_epoch_attester_indices =
-            self.get_attestation_participants_union(&previous_epoch_attestations[..], spec)?;
-        let previous_total_balance = self.get_total_balance(
-            &get_active_validator_indices(&self.validator_registry, previous_epoch),
-            spec,
-        );
-
-        /*
-         * Validators targetting the previous justified slot
-         */
-        let previous_epoch_justified_attestations: Vec<&PendingAttestation> = {
-            let mut a: Vec<&PendingAttestation> = current_epoch_attestations
-                .iter()
-                .filter(|a| a.data.justified_epoch == self.previous_justified_epoch)
-                .cloned()
-                .collect();
-            let mut b: Vec<&PendingAttestation> = previous_epoch_attestations
-                .iter()
-                .filter(|a| a.data.justified_epoch == self.previous_justified_epoch)
-                .cloned()
-                .collect();
-            a.append(&mut b);
-            a
-        };
-
-        let previous_epoch_justified_attester_indices = self
-            .get_attestation_participants_union(&previous_epoch_justified_attestations[..], spec)?;
-        let previous_epoch_justified_attesting_balance =
-            self.get_total_balance(&previous_epoch_justified_attester_indices[..], spec);
-
-        /*
-         * Validators justifying the epoch boundary block at the start of the previous epoch
-         */
-        let previous_epoch_boundary_attestations: Vec<&PendingAttestation> =
-            previous_epoch_justified_attestations
-                .iter()
-                .filter(
-                    |a| match self.get_block_root(self.previous_epoch_start_slot(spec), spec) {
-                        Some(block_root) => a.data.epoch_boundary_root == *block_root,
-                        None => unreachable!(),
-                    },
-                )
-                .cloned()
-                .collect();
-
-        let previous_epoch_boundary_attester_indices = self
-            .get_attestation_participants_union(&previous_epoch_boundary_attestations[..], spec)?;
-        let previous_epoch_boundary_attesting_balance =
-            self.get_total_balance(&previous_epoch_boundary_attester_indices[..], spec);
-
-        /*
-         * Validators attesting to the expected beacon chain head during the previous epoch.
-         */
-        let previous_epoch_head_attestations: Vec<&PendingAttestation> =
-            previous_epoch_attestations
-                .iter()
-                .filter(|a| match self.get_block_root(a.data.slot, spec) {
-                    Some(block_root) => a.data.beacon_block_root == *block_root,
-                    None => unreachable!(),
-                })
-                .cloned()
-                .collect();
-
-        let previous_epoch_head_attester_indices =
-            self.get_attestation_participants_union(&previous_epoch_head_attestations[..], spec)?;
-        let previous_epoch_head_attesting_balance =
-            self.get_total_balance(&previous_epoch_head_attester_indices[..], spec);
-
-        debug!(
-            "previous_epoch_head_attester_balance of {} wei.",
-            previous_epoch_head_attesting_balance
-        );
 
         /*
          * Eth1 Data
@@ -243,7 +127,7 @@ impl EpochProcessable for BeaconState {
         //
         // - Set the 2nd bit of the bitfield.
         // - Set the previous epoch to be justified.
-        if (3 * previous_epoch_boundary_attesting_balance) >= (2 * current_total_balance) {
+        if (3 * attesters.previous_epoch_boundary.balance) >= (2 * current_total_balance) {
             self.justification_bitfield |= 2;
             new_justified_epoch = previous_epoch;
             trace!(">= 2/3 voted for previous epoch boundary");
@@ -252,7 +136,7 @@ impl EpochProcessable for BeaconState {
         //
         // - Set the 1st bit of the bitfield.
         // - Set the current epoch to be justified.
-        if (3 * current_epoch_boundary_attesting_balance) >= (2 * current_total_balance) {
+        if (3 * attesters.current_epoch_boundary.balance) >= (2 * current_total_balance) {
             self.justification_bitfield |= 1;
             new_justified_epoch = current_epoch;
             trace!(">= 2/3 voted for current epoch boundary");
@@ -339,14 +223,14 @@ impl EpochProcessable for BeaconState {
                 let winning_root = winning_root(
                     self,
                     shard,
-                    &current_epoch_attestations,
-                    &previous_epoch_attestations,
+                    &current_epoch_attestations[..],
+                    &previous_epoch_attestations[..],
                     spec,
                 );
 
                 if let Ok(winning_root) = &winning_root {
                     let total_committee_balance =
-                        self.get_total_balance(&crosslink_committee[..], spec);
+                        self.get_total_balance(crosslink_committee.iter(), spec);
 
                     if (3 * winning_root.total_attesting_balance) >= (2 * total_committee_balance) {
                         self.latest_crosslinks[shard as usize] = Crosslink {
@@ -378,49 +262,36 @@ impl EpochProcessable for BeaconState {
          */
         let epochs_since_finality = next_epoch - self.finalized_epoch;
 
-        let previous_epoch_justified_attester_indices_hashset: HashSet<usize> =
-            HashSet::from_iter(previous_epoch_justified_attester_indices.iter().cloned());
-        let previous_epoch_boundary_attester_indices_hashset: HashSet<usize> =
-            HashSet::from_iter(previous_epoch_boundary_attester_indices.iter().cloned());
-        let previous_epoch_head_attester_indices_hashset: HashSet<usize> =
-            HashSet::from_iter(previous_epoch_head_attester_indices.iter().cloned());
-        let previous_epoch_attester_indices_hashset: HashSet<usize> =
-            HashSet::from_iter(previous_epoch_attester_indices.iter().cloned());
         let active_validator_indices_hashset: HashSet<usize> =
             HashSet::from_iter(active_validator_indices.iter().cloned());
-
-        debug!("previous epoch justified attesters: {}, previous epoch boundary attesters: {}, previous epoch head attesters: {}, previous epoch attesters: {}", previous_epoch_justified_attester_indices.len(), previous_epoch_boundary_attester_indices.len(), previous_epoch_head_attester_indices.len(), previous_epoch_attester_indices.len());
-
-        debug!("{} epochs since finality.", epochs_since_finality);
 
         if epochs_since_finality <= 4 {
             for index in 0..self.validator_balances.len() {
                 let base_reward = self.base_reward(index, base_reward_quotient, spec);
 
-                if previous_epoch_justified_attester_indices_hashset.contains(&index) {
+                if attesters.previous_epoch.indices.contains(&index) {
                     safe_add_assign!(
                         self.validator_balances[index],
-                        base_reward * previous_epoch_justified_attesting_balance
+                        base_reward * attesters.previous_epoch.balance / previous_total_balance
+                    );
+                } else if active_validator_indices_hashset.contains(&index) {
+                    safe_sub_assign!(self.validator_balances[index], base_reward);
+                }
+
+                if attesters.previous_epoch_boundary.indices.contains(&index) {
+                    safe_add_assign!(
+                        self.validator_balances[index],
+                        base_reward * attesters.previous_epoch_boundary.balance
                             / previous_total_balance
                     );
                 } else if active_validator_indices_hashset.contains(&index) {
                     safe_sub_assign!(self.validator_balances[index], base_reward);
                 }
 
-                if previous_epoch_boundary_attester_indices_hashset.contains(&index) {
+                if attesters.previous_epoch_head.indices.contains(&index) {
                     safe_add_assign!(
                         self.validator_balances[index],
-                        base_reward * previous_epoch_boundary_attesting_balance
-                            / previous_total_balance
-                    );
-                } else if active_validator_indices_hashset.contains(&index) {
-                    safe_sub_assign!(self.validator_balances[index], base_reward);
-                }
-
-                if previous_epoch_head_attester_indices_hashset.contains(&index) {
-                    safe_add_assign!(
-                        self.validator_balances[index],
-                        base_reward * previous_epoch_head_attesting_balance
+                        base_reward * attesters.previous_epoch_head.balance
                             / previous_total_balance
                     );
                 } else if active_validator_indices_hashset.contains(&index) {
@@ -428,7 +299,7 @@ impl EpochProcessable for BeaconState {
                 }
             }
 
-            for index in previous_epoch_attester_indices {
+            for &index in &attesters.previous_epoch.indices {
                 let base_reward = self.base_reward(index, base_reward_quotient, spec);
                 let inclusion_distance =
                     self.inclusion_distance(&previous_epoch_attestations, index, spec)?;
@@ -447,13 +318,13 @@ impl EpochProcessable for BeaconState {
                     spec,
                 );
                 if active_validator_indices_hashset.contains(&index) {
-                    if !previous_epoch_justified_attester_indices_hashset.contains(&index) {
+                    if !attesters.previous_epoch.indices.contains(&index) {
                         safe_sub_assign!(self.validator_balances[index], inactivity_penalty);
                     }
-                    if !previous_epoch_boundary_attester_indices_hashset.contains(&index) {
+                    if !attesters.previous_epoch_boundary.indices.contains(&index) {
                         safe_sub_assign!(self.validator_balances[index], inactivity_penalty);
                     }
-                    if !previous_epoch_head_attester_indices_hashset.contains(&index) {
+                    if !attesters.previous_epoch_head.indices.contains(&index) {
                         safe_sub_assign!(self.validator_balances[index], inactivity_penalty);
                     }
 
@@ -467,7 +338,7 @@ impl EpochProcessable for BeaconState {
                 }
             }
 
-            for index in previous_epoch_attester_indices {
+            for &index in &attesters.previous_epoch.indices {
                 let base_reward = self.base_reward(index, base_reward_quotient, spec);
                 let inclusion_distance =
                     self.inclusion_distance(&previous_epoch_attestations, index, spec)?;
@@ -485,7 +356,7 @@ impl EpochProcessable for BeaconState {
         /*
          * Attestation inclusion
          */
-        for &index in &previous_epoch_attester_indices_hashset {
+        for &index in &attesters.previous_epoch.indices {
             let inclusion_slot =
                 self.inclusion_slot(&previous_epoch_attestations[..], index, spec)?;
             let proposer_index = self
@@ -500,7 +371,7 @@ impl EpochProcessable for BeaconState {
 
         trace!(
             "Previous epoch attesters: {}.",
-            previous_epoch_attester_indices_hashset.len()
+            attesters.previous_epoch.indices.len()
         );
 
         /*
@@ -619,11 +490,8 @@ impl EpochProcessable for BeaconState {
             .cloned()
             .collect();
 
-        /*
-         * Manage the beacon state caches
-         */
+        // Rotate the epoch caches to suit the epoch transition.
         self.advance_caches();
-        self.build_epoch_cache(RelativeEpoch::Next, spec)?;
 
         debug!("Epoch transition complete.");
 
@@ -662,9 +530,9 @@ fn winning_root(
 
         let attesting_validator_indices = attestations
             .iter()
-            .try_fold::<_, _, Result<_, BeaconStateError>>(vec![], |mut acc, a| {
+            .try_fold::<_, _, Result<_, BeaconStateError>>(HashSet::new(), |mut acc, a| {
                 if (a.data.shard == shard) && (a.data.shard_block_root == *shard_block_root) {
-                    acc.append(&mut state.get_attestation_participants(
+                    acc.extend(state.get_attestation_participants(
                         &a.data,
                         &a.aggregation_bitfield,
                         spec,

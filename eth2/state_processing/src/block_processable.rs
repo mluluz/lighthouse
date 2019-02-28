@@ -343,7 +343,7 @@ fn validate_attestation_signature_optional(
                         .start_slot(spec.epoch_length),
                     &spec
                 )
-                .ok_or(AttestationValidationError::NoBlockRoot)?,
+                .map_err(|_| AttestationValidationError::NoBlockRoot)?,
         AttestationValidationError::WrongJustifiedRoot
     );
     let potential_crosslink = Crosslink {

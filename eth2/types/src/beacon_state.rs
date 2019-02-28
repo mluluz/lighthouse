@@ -11,7 +11,7 @@ use log::{debug, error, trace};
 use rand::RngCore;
 use serde_derive::Serialize;
 use ssz::{hash, Decodable, DecodeError, Encodable, SszStream, TreeHash};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use swap_or_not_shuffle::get_permutated_index;
 
 pub use builder::BeaconStateBuilder;
@@ -40,6 +40,7 @@ pub enum RelativeEpoch {
 #[derive(Debug, PartialEq)]
 pub enum Error {
     EpochOutOfBounds,
+    SlotOutOfBounds,
     /// The supplied shard is unknown. It may be larger than the maximum shard count, or not in a
     /// committee for the given slot.
     ShardOutOfBounds,
@@ -707,7 +708,7 @@ impl BeaconState {
         let current_epoch = self.current_epoch(spec);
         let active_validator_indices =
             get_active_validator_indices(&self.validator_registry, current_epoch);
-        let total_balance = self.get_total_balance(&active_validator_indices[..], spec);
+        let total_balance = self.get_total_balance(active_validator_indices.iter(), spec);
 
         for index in 0..self.validator_balances.len() {
             let validator = &self.validator_registry[index];
@@ -769,7 +770,7 @@ impl BeaconState {
         let current_epoch = self.current_epoch(spec);
         let active_validator_indices =
             get_active_validator_indices(&self.validator_registry, current_epoch);
-        let total_balance = self.get_total_balance(&active_validator_indices[..], spec);
+        let total_balance = self.get_total_balance(active_validator_indices.iter(), spec);
 
         let max_balance_churn = std::cmp::max(
             spec.max_deposit_amount,
@@ -1123,10 +1124,12 @@ impl BeaconState {
     /// Return the combined effective balance of an array of validators.
     ///
     /// Spec v0.2.0
-    pub fn get_total_balance(&self, validator_indices: &[usize], spec: &ChainSpec) -> u64 {
-        validator_indices
-            .iter()
-            .fold(0, |acc, i| acc + self.get_effective_balance(*i, spec))
+    pub fn get_total_balance<'a>(
+        &self,
+        validator_indices: impl Iterator<Item = &'a usize>,
+        spec: &ChainSpec,
+    ) -> u64 {
+        validator_indices.fold(0, |acc, i| acc + self.get_effective_balance(*i, spec))
     }
 
     /// Return the effective balance (also known as "balance at stake") for a validator with the given ``index``.
@@ -1141,30 +1144,15 @@ impl BeaconState {
 
     /// Return the block root at a recent `slot`.
     ///
-    /// Spec v0.2.0
-    pub fn get_block_root(&self, slot: Slot, spec: &ChainSpec) -> Option<&Hash256> {
-        self.latest_block_roots
-            .get(slot.as_usize() % spec.latest_block_roots_length)
-    }
-
-    pub fn get_attestation_participants_union(
-        &self,
-        attestations: &[&PendingAttestation],
-        spec: &ChainSpec,
-    ) -> Result<Vec<usize>, Error> {
-        let mut all_participants = attestations
-            .iter()
-            .try_fold::<_, _, Result<Vec<usize>, Error>>(vec![], |mut acc, a| {
-                acc.append(&mut self.get_attestation_participants(
-                    &a.data,
-                    &a.aggregation_bitfield,
-                    spec,
-                )?);
-                Ok(acc)
-            })?;
-        all_participants.sort_unstable();
-        all_participants.dedup();
-        Ok(all_participants)
+    /// Spec v0.4.0
+    pub fn get_block_root(&self, slot: Slot, spec: &ChainSpec) -> Result<&Hash256, Error> {
+        if (self.slot <= slot + Slot::from(spec.latest_block_roots_length)) & { slot < self.slot } {
+            self.latest_block_roots
+                .get(slot.as_usize() % spec.latest_block_roots_length)
+                .ok_or_else(|| Error::InsufficientBlockRoots)
+        } else {
+            Err(Error::SlotOutOfBounds)
+        }
     }
 
     /// Returns the list of validator indices which participiated in the attestation.
@@ -1177,7 +1165,7 @@ impl BeaconState {
         attestation_data: &AttestationData,
         bitfield: &Bitfield,
         spec: &ChainSpec,
-    ) -> Result<Vec<usize>, Error> {
+    ) -> Result<HashSet<usize>, Error> {
         let epoch = attestation_data.slot.epoch(spec.epoch_length);
         let relative_epoch = self.relative_epoch(epoch, spec)?;
         let cache = self.cache(relative_epoch)?;
@@ -1190,10 +1178,10 @@ impl BeaconState {
 
         assert_eq!(*shard, attestation_data.shard, "Bad epoch cache build.");
 
-        let mut participants = vec![];
+        let mut participants = HashSet::new();
         for (i, validator_index) in committee.iter().enumerate() {
             if bitfield.get(i).unwrap() {
-                participants.push(*validator_index);
+                participants.insert(*validator_index);
             }
         }
 

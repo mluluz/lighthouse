@@ -304,23 +304,15 @@ where
     pub fn produce_attestation_data(&self, shard: u64) -> Result<AttestationData, Error> {
         trace!("BeaconChain::produce_attestation_data: shard: {}", shard);
         let justified_epoch = self.justified_epoch();
-        let justified_block_root = *self
-            .state
-            .read()
-            .get_block_root(
-                justified_epoch.start_slot(self.spec.epoch_length),
-                &self.spec,
-            )
-            .ok_or_else(|| Error::BadRecentBlockRoots)?;
+        let justified_block_root = *self.state.read().get_block_root(
+            justified_epoch.start_slot(self.spec.epoch_length),
+            &self.spec,
+        )?;
 
-        let epoch_boundary_root = *self
-            .state
-            .read()
-            .get_block_root(
-                self.state.read().current_epoch_start_slot(&self.spec),
-                &self.spec,
-            )
-            .ok_or_else(|| Error::BadRecentBlockRoots)?;
+        let epoch_boundary_root = *self.state.read().get_block_root(
+            self.state.read().current_epoch_start_slot(&self.spec),
+            &self.spec,
+        )?;
 
         Ok(AttestationData {
             slot: self.state.read().slot,
@@ -527,7 +519,9 @@ where
             attestations.len()
         );
 
-        let parent_root = *state.get_block_root(state.slot.saturating_sub(1_u64), &self.spec)?;
+        let parent_root = *state
+            .get_block_root(state.slot.saturating_sub(1_u64), &self.spec)
+            .ok()?;
 
         let mut block = BeaconBlock {
             slot: state.slot,
